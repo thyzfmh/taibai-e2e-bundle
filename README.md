@@ -21,40 +21,64 @@ taibai-offline-bundle-linux-amd64-v0.1.0.tar.gz.part_ad
 
 ## 恢复
 
-### 1. 合并并解压
+### 一键恢复 (推荐)
+
+```bash
+# 自动检测容器运行时 (docker / nerdctl / ctr)
+curl -fsSL https://raw.githubusercontent.com/thyzfmh/taibai-e2e-bundle/main/restore.sh | bash
+
+# 指定运行时
+./restore.sh --runtime nerdctl
+./restore.sh --runtime ctr --namespace k8s.io
+```
+
+### 手动恢复
+
+#### 1. 合并并解压
 
 ```bash
 cat taibai-offline-bundle-linux-amd64-v0.1.0.tar.gz.part_* | tar -xzf - -C /tmp
 ```
 
-### 2. 安装 kind（未包含在离线包中）
+#### 2. 安装 kind（未包含在离线包中）
 
 ```bash
 curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
 chmod +x /usr/local/bin/kind
 ```
 
-### 3. 恢复镜像和二进制
+#### 3. 加载镜像
 
 ```bash
 cd /tmp/taibai-offline-bundle
 
-# 加载 Docker 镜像
+# Docker
 for tar_file in images/*.tar; do
   docker load -i "$tar_file"
 done
 
-# 安装太白二进制
+# 或 nerdctl (containerd)
+for tar_file in images/*.tar; do
+  nerdctl -n k8s.io load -i "$tar_file"
+done
+
+# 或 ctr (containerd 原生)
+for tar_file in images/*.tar; do
+  ctr -n k8s.io images import "$tar_file"
+done
+```
+
+#### 4. 安装二进制和脚本
+
+```bash
 sudo cp bin/taibai-* /usr/local/bin/
 sudo chmod +x /usr/local/bin/taibai-*
-
-# 安装 E2E 脚本
 sudo mkdir -p /opt/taibai/hack/e2e-tool/scripts
 sudo cp scripts/* /opt/taibai/hack/e2e-tool/scripts/
 sudo chmod +x /opt/taibai/hack/e2e-tool/scripts/*.sh
 ```
 
-### 4. 运行 E2E 测试
+### 运行 E2E 测试
 
 ```bash
 /opt/taibai/hack/e2e-tool/scripts/taibai-e2e.sh --help
@@ -95,6 +119,7 @@ sudo chmod +x /opt/taibai/hack/e2e-tool/scripts/*.sh
 ## 注意事项
 
 - 本离线包仅包含 **Linux x86_64** 架构的二进制和镜像
+- 支持三种容器运行时加载镜像: **docker** / **nerdctl** / **ctr**
 - `kind` 二进制未包含在内，需单独安装
 - `kindest/node` 镜像未包含在内（体积过大），需单独拉取或构建
 - 太白 ap/agent 组件尚未构建，后续版本会加入

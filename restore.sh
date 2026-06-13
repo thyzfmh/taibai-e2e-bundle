@@ -9,7 +9,8 @@
 #   ./restore.sh --version v0.1.0   # 指定版本 (默认: latest)
 #
 # 前置条件:
-#   - curl, tar, docker
+#   - curl, tar
+#   - 容器运行时: docker / nerdctl / ctr (三选一)
 #   - 网络连接 (仅下载 Release 文件时需要)
 
 set -euo pipefail
@@ -25,6 +26,18 @@ SKIP_IMAGES=false
 SKIP_BINARIES=false
 SKIP_SCRIPTS=false
 DOWNLOAD_ONLY=false
+CONTAINER_RUNTIME=""
+CTR_NAMESPACE="${RESTORE_CTR_NAMESPACE:-k8s.io}"
+
+detect_container_runtime() {
+  if command -v docker &>/dev/null && docker info &>/dev/null; then
+    CONTAINER_RUNTIME="docker"
+  elif command -v nerdctl &>/dev/null; then
+    CONTAINER_RUNTIME="nerdctl"
+  elif command -v ctr &>/dev/null; then
+    CONTAINER_RUNTIME="ctr"
+  fi
+}
 
 # ─── 日志 ─────────────────────────────────────────────────────────────
 log_info()  { echo "[INFO]  $*"; }
@@ -37,10 +50,12 @@ usage() {
   sed -n '2,12p' "$0"
   echo ""
   echo "选项:"
-  echo "  --skip-images      跳过 Docker 镜像加载"
+  echo "  --skip-images      跳过镜像加载"
   echo "  --skip-binaries    跳过二进制安装"
   echo "  --skip-scripts     跳过脚本安装"
   echo "  --download-only    仅下载，不安装"
+  echo "  --runtime RUNTIME  容器运行时: docker/nerdctl/ctr (默认: 自动检测)"
+  echo "  --namespace NS     containerd namespace (默认: k8s.io, 仅 ctr/nerdctl)"
   echo "  --bundle-dir DIR   解压目录 (默认: /tmp/taibai-offline-bundle)"
   echo "  --bin-dir DIR      二进制安装目录 (默认: /usr/local/bin)"
   echo "  --version VER      版本号 (默认: latest)"
@@ -54,6 +69,8 @@ while [[ $# -gt 0 ]]; do
     --skip-binaries)  SKIP_BINARIES=true; shift ;;
     --skip-scripts)   SKIP_SCRIPTS=true; shift ;;
     --download-only)  DOWNLOAD_ONLY=true; shift ;;
+    --runtime)        CONTAINER_RUNTIME="$2"; shift 2 ;;
+    --namespace)      CTR_NAMESPACE="$2"; shift 2 ;;
     --bundle-dir)     BUNDLE_DIR="$2"; shift 2 ;;
     --bin-dir)        BIN_DIR="$2"; shift 2 ;;
     --version)        VERSION="$2"; shift 2 ;;
@@ -71,12 +88,28 @@ check_prereqs() {
       missing=$((missing + 1))
     fi
   done
-  if [[ "$SKIP_IMAGES" == "false" ]] && ! command -v docker &>/dev/null; then
-    log_fail "docker 未安装 (使用 --skip-images 跳过)"
-    missing=$((missing + 1))
+
+  if [[ "$SKIP_IMAGES" == "false" ]]; then
+    if [[ -n "$CONTAINER_RUNTIME" ]]; then
+      if ! command -v "$CONTAINER_RUNTIME" &>/dev/null; then
+        log_fail "指定的运行时 '$CONTAINER_RUNTIME' 未找到"
+        missing=$((missing + 1))
+      fi
+    else
+      detect_container_runtime
+      if [[ -z "$CONTAINER_RUNTIME" ]]; then
+        log_fail "未检测到容器运行时 (需要 docker / nerdctl / ctr，或使用 --skip-images 跳过)"
+        missing=$((missing + 1))
+      fi
+    fi
   fi
+
   if [[ "$missing" -gt 0 ]]; then
     exit 1
+  fi
+
+  if [[ "$SKIP_IMAGES" == "false" ]]; then
+    log_info "容器运行时: ${CONTAINER_RUNTIME}$([[ "$CONTAINER_RUNTIME" != "docker" ]] && echo " (namespace: ${CTR_NAMESPACE})" || true)"
   fi
 }
 
@@ -171,16 +204,42 @@ load_images() {
     return
   fi
 
-  log_info "加载 ${total} 个 Docker 镜像 (可能需要几分钟)..."
+  log_info "加载 ${total} 个镜像到 ${CONTAINER_RUNTIME} (可能需要几分钟)..."
+
+  local load_cmd
+  case "$CONTAINER_RUNTIME" in
+    docker)
+      load_cmd="docker load -i"
+      ;;
+    nerdctl)
+      load_cmd="nerdctl -n ${CTR_NAMESPACE} load -i"
+      ;;
+    ctr)
+      load_cmd="__ctr_import"
+      ;;
+    *)
+      log_fail "不支持的运行时: ${CONTAINER_RUNTIME}"
+      return
+      ;;
+  esac
+
   for tar_file in "${img_dir}"/*.tar; do
     [[ -f "$tar_file" ]] || continue
     count=$((count + 1))
-    local name=$(basename "$tar_file" .tar | sed 's/_/\//g; s/_/\//g; s/_/:/' | head -1)
-    echo -ne "  [${count}/${total}] 加载中...          \r"
-    if docker load -i "$tar_file" &>/dev/null; then
-      echo -ne "  [${count}/${total}] OK                  \n"
+    local label="$(basename "$tar_file" .tar | sed 's/registry.k8s.io_/registry.k8s.io\//; s/_e2e-test-images_/e2e-test-images\//; s/_node-perf_/node-perf\//; s/_volume_/volume\//; s/_build-image_/build-image\//; s/_sig-storage_/sig-storage\//; s/_pause_/pause:/; s/_etcd_/etcd:/; s/_coredns_/coredns\//; s/_distroless-iptables_/distroless-iptables:/; s/_nfs-provisioner_/nfs-provisioner:/; s/_agnhost_/agnhost:/; s/_busybox_/busybox:/; s/_apparmor-loader_/apparmor-loader:/; s/_ipc-utils_/ipc-utils:/; s/_glibc-dns-testing_/glibc-dns-testing:/; s/_kitten_/kitten:/; s/_nautilus_/nautilus:/; s/_nginx_/nginx:/; s/_nonewprivs_/nonewprivs:/; s/_nonroot_/nonroot:/; s/_perl_/perl:/; s/_regression-issue-74839_/regression-issue-74839:/; s/_resource-consumer_/resource-consumer:/; s/_npb-ep_/npb-ep:/; s/_npb-is_/npb-is:/; s/_pytorch-wide-deep_/pytorch-wide-deep:/; s/_nfs_/nfs:/; s/_iscsi_/iscsi:/')"
+    echo -ne "  [${count}/${total}] ${label}          \r"
+
+    if [[ "$CONTAINER_RUNTIME" == "ctr" ]]; then
+      if ctr -n "$CTR_NAMESPACE" images import "$tar_file" &>/dev/null; then
+        echo -ne "  [${count}/${total}] ${label} OK       \n"
+      else
+        echo -ne "  [${count}/${total}] ${label} FAIL     \n"
+        log_warn "  $(basename "$tar_file" .tar) 加载失败"
+      fi
+    elif $load_cmd "$tar_file" &>/dev/null; then
+      echo -ne "  [${count}/${total}] ${label} OK       \n"
     else
-      echo -ne "  [${count}/${total}] FAIL                 \n"
+      echo -ne "  [${count}/${total}] ${label} FAIL     \n"
       log_warn "  $(basename "$tar_file" .tar) 加载失败"
     fi
   done
@@ -260,6 +319,24 @@ install_kind_hint() {
   echo ""
 }
 
+post_install_hint() {
+  echo ""
+  log_info "运行时环境:"
+  echo "  容器运行时:  ${CONTAINER_RUNTIME:-未指定 (已跳过镜像)}"
+  if [[ "$CONTAINER_RUNTIME" != "docker" && -n "$CONTAINER_RUNTIME" ]]; then
+    echo "  namespace:   ${CTR_NAMESPACE}"
+  fi
+  echo ""
+  log_info "验证镜像:"
+  case "${CONTAINER_RUNTIME:-}" in
+    docker)   echo "  docker images | grep registry.k8s.io" ;;
+    nerdctl)  echo "  nerdctl -n ${CTR_NAMESPACE} images | grep registry.k8s.io" ;;
+    ctr)      echo "  ctr -n ${CTR_NAMESPACE} images ls | grep registry.k8s.io" ;;
+  esac
+  echo ""
+  log_info "下一步: ${SCRIPT_DIR}/taibai-e2e.sh --help"
+}
+
 # ─── 主流程 ───────────────────────────────────────────────────────────
 main() {
   log_info "=== 太白 E2E 离线包恢复 ==="
@@ -279,9 +356,9 @@ main() {
   install_binaries
   install_scripts
   install_kind_hint
+  post_install_hint
 
   log_ok "=== 恢复完成 ==="
-  log_info "下一步: ${SCRIPT_DIR}/taibai-e2e.sh --help"
 }
 
 main
